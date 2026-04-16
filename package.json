@@ -1,5 +1,5 @@
 {
-  "name": "tmux-subagents-local",
+  "name": "opencode-tmux",
   "private": true,
   "type": "module",
   "scripts": {

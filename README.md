@@ -1,4 +1,4 @@
-# tmux-subagents
+# opencode-tmux
 
 Local plugin that opens subagents in sibling tmux panes and cleans those panes up when sessions finish.
 
@@ -30,7 +30,7 @@ npm run typecheck
 
 Use a live tmux session with this profile loaded.
 
-1. Keep `opencode.jsonc` pointing at `./plugins/tmux-subagents/src/index.ts`.
+1. Keep `opencode.jsonc` pointing at `./plugins/opencode-tmux/src/index.ts`.
 2. Start OpenCode from inside tmux.
 3. Trigger a `task` tool call that creates a child session.
 4. Confirm a sibling pane appears for the child session (the plugin sets an initial sanitized agent label, but the attached OpenCode UI may replace the visible pane title).
