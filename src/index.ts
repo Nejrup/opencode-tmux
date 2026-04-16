@@ -37,8 +37,10 @@ type SharedSpawnState =
 	} & PaneLocation)
 
 const TASK_TTL_MS = 15_000
+const PENDING_SPAWN_GRACE_MS = 5_000
 const CLEANUP_DELAY_MS = 4_000
 const PROCESS_TERMINATION_GRACE_MS = 1_000
+const SPAWN_LOCK_TIMEOUT_MS = 5_000
 const TMUX_OPTION_PREFIX = "@opencode_subagent_"
 const spawnedSessions = new Set<string>()
 const pendingByParent = new Map<string, PendingTask[]>()
@@ -193,6 +195,23 @@ function clearSharedCleanupGeneration(sessionID: string): void {
 	Bun.spawnSync(["tmux", "set-option", "-gu", optionKey])
 }
 
+async function acquireTmuxLock(lockName: string, timeoutMilliseconds: number): Promise<boolean> {
+	const waitProcess = Bun.spawn(["tmux", "wait-for", "-L", lockName], {
+		stdout: "ignore",
+		stderr: "ignore",
+	})
+
+	const timeout = setTimeout(() => {
+		waitProcess.kill()
+	}, timeoutMilliseconds)
+
+	try {
+		return (await waitProcess.exited) === 0
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
 async function withSpawnLock<T>(sessionID: string, action: () => Promise<T>): Promise<T> {
 	const previousTail = localLockTails.get(sessionID)?.tail ?? Promise.resolve()
 	let releaseLocalLock = () => {}
@@ -204,7 +223,15 @@ async function withSpawnLock<T>(sessionID: string, action: () => Promise<T>): Pr
 
 	await previousTail
 	const lockName = toSpawnLockName(sessionID)
-	Bun.spawnSync(["tmux", "wait-for", "-L", lockName])
+	const didAcquireLock = await acquireTmuxLock(lockName, SPAWN_LOCK_TIMEOUT_MS)
+	if (!didAcquireLock) {
+		releaseLocalLock()
+		if (localLockTails.get(sessionID)?.token === lockToken) {
+			localLockTails.delete(sessionID)
+		}
+		throw new Error(`Timed out waiting for tmux pane lock for session ${sessionID}`)
+	}
+
 	try {
 		return await action()
 	} finally {
@@ -260,6 +287,18 @@ function getLiveTrackedPane(sessionID: string): PaneLocation | undefined {
 	paneBySession.delete(sessionID)
 	spawnedSessions.delete(sessionID)
 	return
+}
+
+function getManagedPane(sessionID: string): PaneLocation | undefined {
+	const liveTrackedPane = getLiveTrackedPane(sessionID)
+	if (liveTrackedPane) return liveTrackedPane
+
+	const sharedState = readSharedSpawnState(sessionID)
+	if (sharedState?.kind !== "live") return
+
+	paneBySession.set(sessionID, sharedState)
+	spawnedSessions.add(sessionID)
+	return sharedState
 }
 
 function bumpCleanupGeneration(sessionID: string): number {
@@ -466,11 +505,11 @@ async function openPaneForSession(options: {
 	tmuxTargetWindowID?: string
 	serverUrl: string
 	log: (level: "debug" | "info" | "warn" | "error", message: string) => Promise<void>
-}): Promise<void> {
+}): Promise<PaneLocation> {
 	const { sessionID, agentName, directory, tmuxTargetWindowID, serverUrl, log } = options
 	const paneLabel = sanitizeLabel(agentName)
 	const opencodeBin = process.env.OPENCODE_BIN || Bun.which("opencode") || "opencode"
-	const paneLocation = await spawnTmuxPane({
+	return spawnTmuxPane({
 		cwd: directory,
 		sessionID,
 		paneLabel,
@@ -479,8 +518,6 @@ async function openPaneForSession(options: {
 		serverUrl,
 		log,
 	})
-	paneBySession.set(sessionID, paneLocation)
-	writeSharedSpawnState(sessionID, { kind: "live", ...paneLocation })
 }
 
 async function ensureSessionPane(options: {
@@ -492,38 +529,54 @@ async function ensureSessionPane(options: {
 	log: (level: "debug" | "info" | "warn" | "error", message: string) => Promise<void>
 }): Promise<void> {
 	const { sessionID, agentName, directory, tmuxTargetWindowID, serverUrl, log } = options
+	type PaneDecision =
+		| { kind: "done" }
+		| { kind: "retry"; delayMilliseconds: number }
+		| { kind: "spawn"; cleanupGeneration: number }
 
-	const shouldSpawn = await withSpawnLock(sessionID, async () => {
-		cancelPaneCleanupTimer(sessionID)
-		bumpSharedCleanupGeneration(sessionID)
+	let paneDecision: PaneDecision
+	while (true) {
+		paneDecision = await withSpawnLock(sessionID, async () => {
+			cancelPaneCleanupTimer(sessionID)
+			const cleanupGeneration = bumpSharedCleanupGeneration(sessionID)
 
-		const liveTrackedPane = getLiveTrackedPane(sessionID)
-		if (liveTrackedPane) {
-			writeSharedSpawnState(sessionID, { kind: "live", ...liveTrackedPane })
-			return false
-		}
+			const liveTrackedPane = getLiveTrackedPane(sessionID)
+			if (liveTrackedPane) {
+				writeSharedSpawnState(sessionID, { kind: "live", ...liveTrackedPane })
+				return { kind: "done" }
+			}
 
-		const sharedState = readSharedSpawnState(sessionID)
-		if (sharedState?.kind === "live") {
-			paneBySession.set(sessionID, sharedState)
+			const sharedState = readSharedSpawnState(sessionID)
+			if (sharedState?.kind === "live") {
+				paneBySession.set(sessionID, sharedState)
+				spawnedSessions.add(sessionID)
+				return { kind: "done" }
+			}
+
+			if (sharedState?.kind === "pending") {
+				const delayMilliseconds = sharedState.createdAt + PENDING_SPAWN_GRACE_MS - Date.now()
+				if (delayMilliseconds > 0) {
+					spawnedSessions.add(sessionID)
+					return { kind: "retry", delayMilliseconds }
+				}
+
+				spawnedSessions.delete(sessionID)
+				clearSharedSpawnState(sessionID)
+			}
+
 			spawnedSessions.add(sessionID)
-			return false
-		}
+			writeSharedSpawnState(sessionID, { kind: "pending", createdAt: Date.now() })
+			return { kind: "spawn", cleanupGeneration }
+		})
 
-		if (sharedState?.kind === "pending") {
-			spawnedSessions.add(sessionID)
-			return false
-		}
+		if (paneDecision.kind !== "retry") break
+		await delay(paneDecision.delayMilliseconds)
+	}
 
-		spawnedSessions.add(sessionID)
-		writeSharedSpawnState(sessionID, { kind: "pending", createdAt: Date.now() })
-		return true
-	})
-
-	if (!shouldSpawn) return
+	if (paneDecision.kind === "done") return
 
 	try {
-		await openPaneForSession({
+		const paneLocation = await openPaneForSession({
 			sessionID,
 			agentName,
 			directory,
@@ -531,6 +584,36 @@ async function ensureSessionPane(options: {
 			serverUrl,
 			log,
 		})
+
+		let shouldKeepPane = false
+		await withSpawnLock(sessionID, async () => {
+			const cleanupGeneration = readSharedCleanupGeneration(sessionID)
+			const sharedState = readSharedSpawnState(sessionID)
+
+			if (
+				cleanupGeneration !== paneDecision.cleanupGeneration ||
+				(sharedState?.kind === "live" && sharedState.paneID !== paneLocation.paneID)
+			) {
+				spawnedSessions.delete(sessionID)
+				if (sharedState?.kind === "pending") {
+					clearSharedSpawnState(sessionID)
+				}
+				return
+			}
+
+			paneBySession.set(sessionID, paneLocation)
+			writeSharedSpawnState(sessionID, { kind: "live", ...paneLocation })
+			shouldKeepPane = true
+		})
+
+		if (!shouldKeepPane) {
+			await killPane({
+				sessionID,
+				paneLocation,
+				log,
+				failurePrefix: "Failed to close canceled tmux pane",
+			})
+		}
 	} catch (error) {
 		await withSpawnLock(sessionID, async () => {
 			spawnedSessions.delete(sessionID)
@@ -556,12 +639,21 @@ async function killPane(options: {
 	log: (level: "debug" | "info" | "warn" | "error", message: string) => Promise<void>
 	failurePrefix: string
 	shouldAbort?: () => boolean
+	gracefulTerminate?: boolean
 }): Promise<boolean> {
-	const { sessionID, paneLocation, log, failurePrefix, shouldAbort } = options
+	const {
+		sessionID,
+		paneLocation,
+		log,
+		failurePrefix,
+		shouldAbort,
+		gracefulTerminate = true,
+	} = options
 	if (shouldAbort?.()) return false
 
-	const panePID = resolvePanePID(paneLocation)
+	const panePID = gracefulTerminate ? resolvePanePID(paneLocation) : undefined
 	if (panePID) {
+		if (shouldAbort?.()) return false
 		try {
 			process.kill(panePID, "SIGTERM")
 			await log(
@@ -601,13 +693,6 @@ async function killPane(options: {
 	return true
 }
 
-function readAndClearTmuxOption(optionKey: string): string | undefined {
-	const optionResult = Bun.spawnSync(["tmux", "show-options", "-gqv", optionKey])
-	const optionValue = optionResult.exitCode === 0 ? toNonEmptyString(optionResult.stdout.toString()) : undefined
-	Bun.spawnSync(["tmux", "set-option", "-gu", optionKey])
-	return optionValue
-}
-
 async function autoCleanupKillPane(options: {
 	sessionID: string
 	paneLocation: PaneLocation
@@ -615,58 +700,16 @@ async function autoCleanupKillPane(options: {
 	log: (level: "debug" | "info" | "warn" | "error", message: string) => Promise<void>
 }): Promise<boolean> {
 	const { sessionID, paneLocation, sharedGeneration, log } = options
-	const resultOptionKey = `${toCleanupOptionKey(sessionID)}_result_${process.pid}_${Date.now()}`
-	const script = [
-		`generation=$(tmux show-options -gqv ${shellQuote(toCleanupOptionKey(sessionID))})`,
-		`if [ "$generation" != ${shellQuote(String(sharedGeneration))} ]; then`,
-		`  tmux set-option -gq ${shellQuote(resultOptionKey)} stale`,
-		`elif ! tmux display-message -p -t ${shellQuote(paneLocation.paneID)} '#{pane_id}' >/dev/null 2>&1; then`,
-		`  tmux set-option -gq ${shellQuote(resultOptionKey)} missing`,
-		`elif kill_output=$(tmux kill-pane -t ${shellQuote(paneLocation.paneID)} 2>&1); then`,
-		`  tmux select-layout -t ${shellQuote(paneLocation.windowID)} main-vertical >/dev/null 2>&1 || true`,
-		`  tmux set-option -gq ${shellQuote(resultOptionKey)} killed`,
-		`elif printf '%s' "$kill_output" | grep -F "can't find pane" >/dev/null 2>&1; then`,
-		`  tmux select-layout -t ${shellQuote(paneLocation.windowID)} main-vertical >/dev/null 2>&1 || true`,
-		`  tmux set-option -gq ${shellQuote(resultOptionKey)} missing`,
-		`else`,
-		`  tmux set-option -gq ${shellQuote(resultOptionKey)} failed`,
-		`fi`,
-	].join(" ")
+	const shouldAbort = (): boolean => readSharedCleanupGeneration(sessionID) !== sharedGeneration
 
-	const cleanupResult = Bun.spawnSync([
-		"tmux",
-		"wait-for",
-		"-L",
-		toSpawnLockName(sessionID),
-		";",
-		"run-shell",
-		script,
-		";",
-		"wait-for",
-		"-U",
-		toSpawnLockName(sessionID),
-	])
-	if (cleanupResult.exitCode !== 0) {
-		await log(
-			"warn",
-			`Failed to run locked auto-cleanup for ${sessionID}: ${cleanupResult.stderr.toString().trim() || "tmux command failed"}`,
-		)
-		readAndClearTmuxOption(resultOptionKey)
-		return false
-	}
-
-	const result = readAndClearTmuxOption(resultOptionKey)
-	if (result === "killed" || result === "missing") {
-		return true
-	}
-
-	if (result && result !== "stale") {
-		await log("warn", `Failed to auto-clean tmux pane ${paneLocation.paneID} for ${sessionID}`)
-	} else if (!result) {
-		await log("warn", `Locked auto-cleanup returned no result for ${sessionID}`)
-	}
-
-	return false
+	return killPane({
+		sessionID,
+		paneLocation,
+		log,
+		failurePrefix: "Failed to auto-clean tmux pane",
+		shouldAbort,
+		gracefulTerminate: false,
+	})
 }
 
 async function schedulePaneCleanup(options: {
@@ -674,7 +717,7 @@ async function schedulePaneCleanup(options: {
 	log: (level: "debug" | "info" | "warn" | "error", message: string) => Promise<void>
 }): Promise<void> {
 	const { sessionID, log } = options
-	const paneLocation = paneBySession.get(sessionID)
+	const paneLocation = getManagedPane(sessionID)
 	if (!paneLocation) return
 
 	const { localGeneration, sharedGeneration } = await withSpawnLock(sessionID, async () => ({
@@ -768,38 +811,55 @@ export const TmuxSubagentsPlugin: Plugin = async ({ client, directory, serverUrl
 		event: async ({ event }) => {
 			if (!isInsideTmux()) return
 
-			if (event.type === "session.idle") {
-				const sessionID = (event.properties as { sessionID?: string }).sessionID
-				if (sessionID) {
+		if (event.type === "session.idle") {
+			const sessionID = (event.properties as { sessionID?: string }).sessionID
+			if (sessionID) {
+				try {
 					await schedulePaneCleanup({ sessionID, log })
+				} catch (error) {
+					await log(
+						"warn",
+						`Failed to schedule tmux pane cleanup for ${sessionID}: ${error instanceof Error ? error.message : String(error)}`,
+					)
 				}
-				return
 			}
+			return
+		}
 
-			if (event.type === "session.deleted") {
-				const sessionID = (event.properties as { info?: SessionInfo }).info?.id
-				if (sessionID) {
+		if (event.type === "session.deleted") {
+			const sessionID = (event.properties as { info?: SessionInfo }).info?.id
+			if (sessionID) {
+				try {
 					await withSpawnLock(sessionID, async () => {
 						cancelPaneCleanupTimer(sessionID)
 						clearSharedCleanupGeneration(sessionID)
 					})
-					const paneLocation = paneBySession.get(sessionID)
+					const paneLocation = getManagedPane(sessionID)
 					if (paneLocation) {
-						await killPane({
+						const didKillPane = await killPane({
 							sessionID,
 							paneLocation,
 							log,
 							failurePrefix: "Failed to close tmux pane",
 						})
+						if (!didKillPane) {
+							return
+						}
 					}
 					paneBySession.delete(sessionID)
 					spawnedSessions.delete(sessionID)
 					clearSharedSpawnState(sessionID)
 					clearSharedCleanupGeneration(sessionID)
 					cleanupGenerations.delete(sessionID)
+				} catch (error) {
+					await log(
+						"warn",
+						`Failed to close tmux pane for deleted session ${sessionID}: ${error instanceof Error ? error.message : String(error)}`,
+					)
 				}
-				return
 			}
+			return
+		}
 
 			if (event.type !== "session.created") return
 
