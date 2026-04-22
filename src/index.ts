@@ -440,7 +440,7 @@ function getFreshPaneIdleGuardRemainingMilliseconds(sessionID: string): number {
 
 function getManagedPane(sessionID: string, windowID?: string): PaneLocation | undefined {
 	const liveTrackedPane = getLiveTrackedPane(sessionID, windowID)
-	if (liveTrackedPane)o return liveTrackedPane
+	if (liveTrackedPane) return liveTrackedPane
 
 	const sharedState = readSharedSpawnState(sessionID, windowID)
 	if (sharedState?.kind !== "live") return
