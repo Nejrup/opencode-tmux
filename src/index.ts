@@ -36,12 +36,14 @@ type SharedSpawnState =
 const TASK_TTL_MS = 15_000
 const PENDING_SPAWN_GRACE_MS = 5_000
 const CLEANUP_DELAY_MS = 4_000
+const FRESH_PANE_IDLE_GUARD_MS = 5_000
 const PROCESS_TERMINATION_GRACE_MS = 1_000
 const SPAWN_LOCK_TIMEOUT_MS = 5_000
 const TMUX_OPTION_PREFIX = "@opencode_subagent_"
 const spawnedSessions = new Set<string>()
 const pendingByParent = new Map<string, PendingTask[]>()
 const paneBySession = new Map<string, PaneLocation>()
+const paneActivatedAtBySession = new Map<string, number>()
 const cleanupTimers = new Map<string, Timer>()
 const cleanupGenerations = new Map<string, number>()
 const localLockTails = new Map<string, { tail: Promise<void>; token: symbol }>()
@@ -425,13 +427,20 @@ function getLiveTrackedPane(sessionID: string, windowID?: string): PaneLocation 
 	if (isPaneLive(paneLocation)) return paneLocation
 
 	paneBySession.delete(sessionID)
+	paneActivatedAtBySession.delete(sessionID)
 	spawnedSessions.delete(sessionID)
 	return
 }
 
+function getFreshPaneIdleGuardRemainingMilliseconds(sessionID: string): number {
+	const activatedAt = paneActivatedAtBySession.get(sessionID)
+	if (!activatedAt) return 0
+	return Math.max(0, activatedAt + FRESH_PANE_IDLE_GUARD_MS - Date.now())
+}
+
 function getManagedPane(sessionID: string, windowID?: string): PaneLocation | undefined {
 	const liveTrackedPane = getLiveTrackedPane(sessionID, windowID)
-	if (liveTrackedPane) return liveTrackedPane
+	if (liveTrackedPane)o return liveTrackedPane
 
 	const sharedState = readSharedSpawnState(sessionID, windowID)
 	if (sharedState?.kind !== "live") return
@@ -760,6 +769,7 @@ async function ensureSessionPane(options: {
 			}
 
 			paneBySession.set(sessionID, paneLocation)
+			paneActivatedAtBySession.set(sessionID, Date.now())
 			await registerSessionWindowID(sessionID, windowID)
 			writeSharedSpawnState(sessionID, { kind: "live", ...paneLocation }, windowID)
 			shouldKeepPane = true
@@ -940,6 +950,7 @@ async function schedulePaneCleanup(options: {
 		if (cleanedPaneIDs.length === 0) return
 
 		paneBySession.delete(sessionID)
+		paneActivatedAtBySession.delete(sessionID)
 		spawnedSessions.delete(sessionID)
 		clearSessionOwnerWindowID(sessionID)
 		cleanupGenerations.delete(sessionID)
@@ -999,6 +1010,28 @@ export const TmuxSubagentsPlugin: Plugin = async ({ client, directory, serverUrl
 		if (event.type === "session.idle") {
 			const sessionID = (event.properties as { sessionID?: string }).sessionID
 			if (sessionID) {
+				const freshPaneIdleGuardRemainingMilliseconds = getFreshPaneIdleGuardRemainingMilliseconds(sessionID)
+				if (freshPaneIdleGuardRemainingMilliseconds > 0) {
+					cancelPaneCleanupTimer(sessionID)
+					const timer = setTimeout(() => {
+						cleanupTimers.delete(sessionID)
+						void schedulePaneCleanup({ sessionID, log }).catch(async (error) => {
+							await log(
+								"warn",
+								`Failed to schedule deferred tmux pane cleanup for ${sessionID}: ${error instanceof Error ? error.message : String(error)}`,
+							)
+						})
+					}, freshPaneIdleGuardRemainingMilliseconds)
+
+					timer.unref?.()
+					cleanupTimers.set(sessionID, timer)
+					await log(
+						"debug",
+						`Deferred idle cleanup for freshly opened pane in session ${sessionID} by ${freshPaneIdleGuardRemainingMilliseconds}ms`,
+					)
+					return
+				}
+
 				try {
 					await schedulePaneCleanup({ sessionID, log })
 				} catch (error) {
@@ -1041,6 +1074,7 @@ export const TmuxSubagentsPlugin: Plugin = async ({ client, directory, serverUrl
 						clearSharedCleanupGeneration(sessionID, windowID)
 					}
 					paneBySession.delete(sessionID)
+					paneActivatedAtBySession.delete(sessionID)
 					spawnedSessions.delete(sessionID)
 					clearSessionOwnerWindowID(sessionID)
 					cleanupGenerations.delete(sessionID)
