@@ -887,9 +887,9 @@ async function schedulePaneCleanup(options: {
 	const generationsByWindow = new Map<string, number>()
 	for (const windowID of windowIDs) {
 		const paneLocation = getManagedPane(sessionID, windowID)
-		if (paneLocation) {
-			panesByWindow.set(windowID, paneLocation)
-		}
+		if (!paneLocation) continue
+
+		panesByWindow.set(windowID, paneLocation)
 
 		const sharedGeneration = await withSpawnLock(sessionID, windowID, async () =>
 			bumpSharedCleanupGeneration(sessionID, windowID),
