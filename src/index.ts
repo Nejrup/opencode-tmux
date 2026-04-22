@@ -1,7 +1,4 @@
-import * as os from "node:os"
-import * as path from "node:path"
 import { createHash } from "node:crypto"
-import { chmod, rm } from "node:fs/promises"
 import type { Plugin } from "@opencode-ai/plugin"
 
 type SessionInfo = {
@@ -58,10 +55,6 @@ type TaskToolArgs = Record<string, unknown> & {
 
 function isInsideTmux(): boolean {
 	return Boolean(process.env.TMUX)
-}
-
-function shellQuote(value: string): string {
-	return `'${value.replace(/'/g, `'"'"'`)}'`
 }
 
 function sanitizeLabel(value: string): string {
@@ -590,7 +583,6 @@ async function spawnTmuxPane(options: {
 }): Promise<PaneLocation> {
 	const { cwd, sessionID, paneLabel, tmuxTargetWindowID, opencodeBin, serverUrl, log } = options
 	const splitTarget = resolveSplitTarget(tmuxTargetWindowID)
-	const scriptPath = path.join(os.tmpdir(), `opencode-subagent-${sessionID}.sh`)
 	const envVars = {
 		OPENCODE_BIN: process.env.OPENCODE_BIN,
 		OPENCODE_CONFIG: process.env.OPENCODE_CONFIG,
@@ -601,31 +593,19 @@ async function spawnTmuxPane(options: {
 		OPENCODE_SERVER_USERNAME: process.env.OPENCODE_SERVER_USERNAME,
 		OPENCODE_SERVER_PASSWORD: process.env.OPENCODE_SERVER_PASSWORD,
 	}
-
-	const envLines = Object.entries(envVars)
+	const tmuxEnvArgs = Object.entries(envVars)
 		.filter((entry): entry is [string, string] => Boolean(entry[1]))
-		.map(([key, value]) => `export ${key}=${shellQuote(value)}`)
+		.flatMap(([key, value]) => ["-e", `${key}=${value}`])
 
 	const command = [
-		shellQuote(opencodeBin),
+		opencodeBin,
 		"attach",
-		shellQuote(serverUrl),
+		serverUrl,
 		"--dir",
-		shellQuote(cwd),
+		cwd,
 		"--session",
-		shellQuote(sessionID),
+		sessionID,
 	]
-
-	const script = [
-		"#!/bin/bash",
-		"trap 'rm -f \"$0\"' EXIT INT TERM",
-		...envLines,
-		`cd ${shellQuote(cwd)} || exit 1`,
-		`exec ${command.join(" ")}`,
-	].join("\n")
-
-	await Bun.write(scriptPath, script)
-	await chmod(scriptPath, 0o755)
 
 	const splitResult = Bun.spawnSync([
 		"tmux",
@@ -633,18 +613,17 @@ async function spawnTmuxPane(options: {
 		"-d",
 		splitTarget.direction,
 		...(splitTarget.target ? ["-t", splitTarget.target] : []),
+		...tmuxEnvArgs,
 		"-c",
 		cwd,
 		"-P",
 		"-F",
 		"#{pane_id} #{window_id} #{pane_pid}",
 		"--",
-		"bash",
-		scriptPath,
+		...command,
 	])
 
 	if (splitResult.exitCode !== 0) {
-		await rm(scriptPath, { force: true }).catch(() => {})
 		throw new Error(splitResult.stderr.toString().trim() || "tmux split-window failed")
 	}
 
@@ -831,6 +810,7 @@ async function killPane(options: {
 		gracefulTerminate = true,
 	} = options
 	if (shouldAbort?.()) return false
+	if (!isPaneLive(paneLocation)) return true
 
 	const panePID = gracefulTerminate ? resolvePanePID(paneLocation) : undefined
 	if (panePID) {
