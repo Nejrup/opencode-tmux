@@ -728,16 +728,17 @@ async function ensureSessionPane(options: {
 			}
 
 			cancelPaneCleanupTimer(sessionID)
-			const cleanupGeneration = bumpSharedCleanupGeneration(sessionID, windowID)
 
 			const liveTrackedPane = getLiveTrackedPane(sessionID, windowID)
 			if (liveTrackedPane) {
+				bumpSharedCleanupGeneration(sessionID, windowID)
 				writeSharedSpawnState(sessionID, { kind: "live", ...liveTrackedPane }, windowID)
 				return { kind: "done" }
 			}
 
 			const sharedState = readSharedSpawnState(sessionID, windowID)
 			if (sharedState?.kind === "live") {
+				bumpSharedCleanupGeneration(sessionID, windowID)
 				paneBySession.set(sessionID, sharedState)
 				spawnedSessions.add(sessionID)
 				return { kind: "done" }
@@ -757,6 +758,7 @@ async function ensureSessionPane(options: {
 
 			spawnedSessions.add(sessionID)
 			await registerSessionWindowID(sessionID, windowID)
+			const cleanupGeneration = bumpSharedCleanupGeneration(sessionID, windowID)
 			writeSharedSpawnState(sessionID, { kind: "pending", createdAt: Date.now() }, windowID)
 			return { kind: "spawn", cleanupGeneration }
 		})
