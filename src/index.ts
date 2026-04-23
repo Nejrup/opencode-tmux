@@ -40,6 +40,7 @@ const FRESH_PANE_IDLE_GUARD_MS = 5_000
 const PROCESS_TERMINATION_GRACE_MS = 1_000
 const SPAWN_LOCK_TIMEOUT_MS = 5_000
 const TMUX_OPTION_PREFIX = "@opencode_subagent_"
+const TMUX_MANAGED_PANE_OPTION = "@opencode_subagent_session"
 const spawnedSessions = new Set<string>()
 const pendingByParent = new Map<string, PendingTask[]>()
 const paneBySession = new Map<string, PaneLocation>()
@@ -245,7 +246,7 @@ function readSharedSpawnState(sessionID: string, windowID?: string): SharedSpawn
 		windowID: paneWindowID,
 		panePID: toPositiveInteger(panePIDValue),
 	}
-	if (!isPaneLive(paneLocation)) {
+	if (!isManagedPaneLive(sessionID, paneLocation)) {
 		clearSharedSpawnState(sessionID, windowID)
 		return
 	}
@@ -420,11 +421,42 @@ function isPaneLive(paneLocation: PaneLocation): boolean {
 	return toNonEmptyString(paneResult.stdout.toString()) === paneLocation.paneID
 }
 
+function readManagedPaneSessionID(paneID: string): string | undefined {
+	const optionResult = Bun.spawnSync([
+		"tmux",
+		"show-options",
+		"-pqv",
+		"-t",
+		paneID,
+		TMUX_MANAGED_PANE_OPTION,
+	])
+	if (optionResult.exitCode !== 0) return
+
+	return toNonEmptyString(optionResult.stdout.toString())
+}
+
+function writeManagedPaneSessionID(paneID: string, sessionID: string): void {
+	Bun.spawnSync([
+		"tmux",
+		"set-option",
+		"-pq",
+		"-t",
+		paneID,
+		TMUX_MANAGED_PANE_OPTION,
+		sessionID,
+	])
+}
+
+function isManagedPaneLive(sessionID: string, paneLocation: PaneLocation): boolean {
+	if (!isPaneLive(paneLocation)) return false
+	return readManagedPaneSessionID(paneLocation.paneID) === sessionID
+}
+
 function getLiveTrackedPane(sessionID: string, windowID?: string): PaneLocation | undefined {
 	const paneLocation = paneBySession.get(sessionID)
 	if (!paneLocation) return
 	if (windowID && paneLocation.windowID !== windowID) return
-	if (isPaneLive(paneLocation)) return paneLocation
+	if (isManagedPaneLive(sessionID, paneLocation)) return paneLocation
 
 	paneBySession.delete(sessionID)
 	paneActivatedAtBySession.delete(sessionID)
@@ -644,6 +676,7 @@ async function spawnTmuxPane(options: {
 	const panePID = toPositiveInteger(panePIDValue)
 
 	Bun.spawnSync(["tmux", "select-pane", "-t", paneID, "-T", paneLabel])
+	writeManagedPaneSessionID(paneID, sessionID)
 	Bun.spawnSync(["tmux", "set-option", "-w", "-t", windowID, "main-pane-width", "50%"])
 	Bun.spawnSync(["tmux", "select-layout", "-t", windowID, "main-vertical"])
 	await log("info", `Spawned tmux pane for ${paneLabel} (${sessionID})`)
@@ -821,6 +854,13 @@ async function killPane(options: {
 	} = options
 	if (shouldAbort?.()) return false
 	if (!isPaneLive(paneLocation)) return true
+	if (!isManagedPaneLive(sessionID, paneLocation)) {
+		await log(
+			"warn",
+			`Skipped tmux cleanup for ${paneLocation.paneID} in ${sessionID} because it is no longer marked as a managed subagent pane`,
+		)
+		return true
+	}
 
 	const panePID = gracefulTerminate ? resolvePanePID(paneLocation) : undefined
 	if (panePID) {
